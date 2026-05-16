@@ -1,23 +1,12 @@
-import aiohttp
+import yt_dlp
 import os
 import tempfile
 import re
-from config import COBALT_API, MAX_FILE_SIZE_BYTES, SUPPORTED_DOMAINS
+from config import MAX_FILE_SIZE_BYTES, SUPPORTED_DOMAINS
 
 
 class CobaltError(Exception):
     pass
-
-
-ERROR_MAP = {
-    "error.api.url.invalid": "Неверная ссылка. Проверь URL и попробуй снова.",
-    "error.api.url.unsupported": "Эта платформа не поддерживается.",
-    "error.api.content.unavailable": "Видео недоступно (удалено или приватное).",
-    "error.api.content.age_restricted": "Видео с возрастным ограничением — не могу скачать.",
-    "error.api.content.private": "Видео приватное — доступ закрыт.",
-    "error.api.rate_exceeded": "Слишком много запросов. Подожди немного.",
-    "error.api.unreachable": "Сервис временно недоступен. Попробуй через минуту.",
-}
 
 
 def detect_platform(url: str) -> str:
@@ -35,90 +24,89 @@ def detect_platform(url: str) -> str:
     for pattern, name in mapping.items():
         if re.search(pattern, url):
             return name
-    return "Unknown"
+    return "Видео"
 
 
 def is_supported_url(url: str) -> bool:
-    return any(d in url for d in SUPPORTED_DOMAINS)
+    return url.startswith("http")
 
 
 async def fetch_download_url(url: str, audio_only: bool = False, quality: str = "max") -> dict:
-    """
-    Returns dict:
-        {"type": "direct", "url": "...", "filename": "..."}
-        {"type": "picker", "items": [...], "audio": "..."}
-    Raises CobaltError on failure.
-    """
-    body = {"url": url}
+    """Скачивает видео через yt-dlp и возвращает путь к файлу."""
+
+    tmp_dir = tempfile.mkdtemp()
+    out_template = os.path.join(tmp_dir, "%(title).50s.%(ext)s")
 
     if audio_only:
-        body["downloadMode"] = "audio"
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "quiet": True,
+            "no_warnings": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
     else:
-        body["downloadMode"] = "auto"
+        if quality == "max":
+            fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        else:
+            fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]"
 
-    if quality != "max":
-        body["videoQuality"] = quality
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                COBALT_API, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                data = await resp.json(content_type=None)
-        except aiohttp.ClientError as e:
-            raise CobaltError(f"Ошибка подключения к сервису: {e}")
-
-    status = data.get("status", "")
-
-    if status == "error":
-        code = data.get("error", {}).get("code", "")
-        msg = ERROR_MAP.get(code, f"Ошибка: {code or 'неизвестная'}")
-        raise CobaltError(msg)
-
-    if status in ("redirect", "tunnel"):
-        return {
-            "type": "direct",
-            "url": data["url"],
-            "filename": data.get("filename", "video"),
+        ydl_opts = {
+            "format": fmt,
+            "outtmpl": out_template,
+            "quiet": True,
+            "no_warnings": True,
+            "merge_output_format": "mp4",
         }
 
-    if status == "picker":
-        return {
-            "type": "picker",
-            "items": data.get("picker", []),
-            "audio": data.get("audio"),
-        }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-    raise CobaltError("Неожиданный ответ от сервиса. Попробуй ещё раз.")
+            # Если аудио — ищем mp3
+            if audio_only:
+                filename = os.path.splitext(filename)[0] + ".mp3"
+
+            # Найти реальный файл если имя немного другое
+            if not os.path.exists(filename):
+                files = os.listdir(tmp_dir)
+                if files:
+                    filename = os.path.join(tmp_dir, files[0])
+                else:
+                    raise CobaltError("Файл не найден после скачивания.")
+
+            size = os.path.getsize(filename)
+            if size > MAX_FILE_SIZE_BYTES:
+                os.unlink(filename)
+                os.rmdir(tmp_dir)
+                return {"type": "too_large", "title": info.get("title", "Видео")}
+
+            return {
+                "type": "file",
+                "path": filename,
+                "filename": os.path.basename(filename),
+                "title": info.get("title", "Видео"),
+            }
+
+    except yt_dlp.utils.DownloadError as e:
+        err = str(e).lower()
+        if "private" in err:
+            raise CobaltError("Видео приватное — доступ закрыт.")
+        if "not available" in err or "unavailable" in err:
+            raise CobaltError("Видео недоступно (удалено или заблокировано).")
+        if "sign in" in err or "login" in err:
+            raise CobaltError("Видео требует авторизации.")
+        if "copyright" in err:
+            raise CobaltError("Видео заблокировано по авторским правам.")
+        raise CobaltError(f"Не удалось скачать: {str(e)[:150]}")
+    except Exception as e:
+        raise CobaltError(f"Ошибка: {str(e)[:150]}")
 
 
-async def download_file(url: str, filename: str) -> str | None:
-    """
-    Downloads file to a temp path. Returns path or None if too large.
-    Caller must delete the file after use.
-    """
-    tmp = tempfile.mktemp(suffix="_" + filename[-20:])
-    downloaded = 0
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            # Check Content-Length if available
-            cl = resp.headers.get("Content-Length")
-            if cl and int(cl) > MAX_FILE_SIZE_BYTES:
-                return None
-
-            with open(tmp, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 64):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE_BYTES:
-                        f.close()
-                        os.unlink(tmp)
-                        return None
-                    f.write(chunk)
-
-    return tmp
+async def download_file(url: str, filename: str):
+    pass  # Не используется с yt-dlp
