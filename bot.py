@@ -1,13 +1,14 @@
 import asyncio
 import os
 import logging
+import random
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
     FSInputFile,
 )
@@ -26,12 +27,27 @@ log = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
+# Рекламные блоки — меняй ссылки и текст под своих рекламодателей
+ADS = [
+    {
+        "text": "🎰 <b>1WIN</b> — лучший букмекер!\nБонус 500% на первый депозит 🔥",
+        "button": "Забрать бонус",
+        "url": "https://1win.com",
+    },
+    {
+        "text": "⚽️ <b>Melbet</b> — ставки на спорт!\nРегистрируйся и получи фрибет 💰",
+        "button": "Получить фрибет",
+        "url": "https://melbet.com",
+    },
+]
+
+AD_EVERY_N = 5  # показывать рекламу каждые N скачиваний
+
 
 def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="⚡️ Premium", callback_data="show_premium")
     b.button(text="❓ Помощь", callback_data="help")
-    b.adjust(2)
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -47,30 +63,22 @@ def kb_premium() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def check_limit(user_id: int) -> tuple[bool, int]:
-    if await db.is_premium(user_id):
-        return True, 999
-    await db.reset_daily_if_needed(user_id)
-    used = await db.get_downloads_today(user_id)
-    left = config.FREE_DOWNLOADS_PER_DAY - used
-    return left > 0, max(left, 0)
+def kb_ad(url: str, button_text: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=button_text, url=url)
+    b.adjust(1)
+    return b.as_markup()
 
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
     await db.get_or_create_user(msg.from_user.id, msg.from_user.username or "", msg.from_user.first_name or "")
-    premium = await db.is_premium(msg.from_user.id)
-    await db.reset_daily_if_needed(msg.from_user.id)
-    used = await db.get_downloads_today(msg.from_user.id)
-    left = config.FREE_DOWNLOADS_PER_DAY - used
-    status = "⭐️ <b>Premium</b>" if premium else f"🆓 Бесплатно: <b>{left}/{config.FREE_DOWNLOADS_PER_DAY}</b> сегодня"
     text = (
         f"👋 Привет, <b>{msg.from_user.first_name}</b>!\n\n"
         "Скачиваю видео без водяных знаков с:\n"
         "▸ YouTube · TikTok · Instagram · VK\n"
         "▸ Twitter/X · Reddit · Twitch · и ещё 1000+\n\n"
-        "📎 <b>Просто отправь мне ссылку</b> — и всё!\n\n"
-        f"📊 Статус: {status}"
+        "📎 <b>Просто отправь мне ссылку</b> — и всё!"
     )
     await msg.answer(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
 
@@ -84,8 +92,7 @@ async def cb_help(cq: CallbackQuery):
         "3. Получи файл без водяного знака!\n\n"
         "🎵 <b>Только аудио</b> — добавь перед ссылкой: <code>audio </code>\n"
         "Пример: <code>audio https://youtu.be/xxx</code>\n\n"
-        f"🆓 Бесплатно: <b>{config.FREE_DOWNLOADS_PER_DAY} видео/день</b>\n"
-        "⭐️ Premium: безлимит"
+        "📋 Поддерживаю: YouTube, TikTok, Instagram, VK, Twitter/X, Reddit, Twitch и 1000+ других."
     )
     await cq.message.edit_text(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
     await cq.answer()
@@ -93,23 +100,10 @@ async def cb_help(cq: CallbackQuery):
 
 @dp.callback_query(F.data == "back_main")
 async def cb_back(cq: CallbackQuery):
-    await cq.message.edit_text("Отправь мне ссылку на видео 👇", reply_markup=kb_main())
-    await cq.answer()
-
-
-@dp.callback_query(F.data == "show_premium")
-async def cb_show_premium(cq: CallbackQuery):
-    if await db.is_premium(cq.from_user.id):
-        await cq.answer("У тебя уже есть Premium! 🎉", show_alert=True)
-        return
-    text = (
-        "⭐️ <b>VidBot Premium</b>\n\n"
-        "✅ Безлимитные скачивания\n"
-        "✅ Максимальное качество (4K)\n"
-        "✅ Без ожиданий\n\n"
-        "Оплата через Telegram Stars:"
+    await cq.message.edit_text(
+        "Отправь мне ссылку на видео 👇",
+        reply_markup=kb_main(),
     )
-    await cq.message.edit_text(text, reply_markup=kb_premium(), parse_mode=ParseMode.HTML)
     await cq.answer()
 
 
@@ -123,7 +117,7 @@ async def cb_buy(cq: CallbackQuery):
     await bot.send_invoice(
         chat_id=cq.from_user.id,
         title=f"VidBot Premium — {plan['label']}",
-        description=f"Безлимитное скачивание видео без водяных знаков.",
+        description="Безлимитное скачивание видео без водяных знаков.",
         payload=plan["payload"],
         currency="XTR",
         prices=[LabeledPrice(label=plan["label"], amount=plan["stars"])],
@@ -170,18 +164,8 @@ async def handle_url(msg: Message):
         )
         return
 
-    can_dl, left = await check_limit(msg.from_user.id)
-    if not can_dl:
-        await msg.answer(
-            f"😔 Бесплатный лимит исчерпан ({config.FREE_DOWNLOADS_PER_DAY}/день).\n\n"
-            "⚡️ Купи Premium для безлимита:",
-            reply_markup=kb_premium(),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     platform = detect_platform(raw)
-    status_msg = await msg.answer(f"⏳ Скачиваю с {platform}... это может занять до 1 минуты")
+    status_msg = await msg.answer(f"⏳ Скачиваю с {platform}...")
 
     filepath = None
     try:
@@ -195,8 +179,7 @@ async def handle_url(msg: Message):
 
     if result["type"] == "too_large":
         await status_msg.edit_text(
-            f"⚠️ Видео слишком большое для отправки в Telegram (>{config.MAX_FILE_SIZE_MB}MB).\n"
-            "Попробуй запросить более низкое качество: отправь ссылку снова."
+            f"⚠️ Видео слишком большое для отправки в Telegram (>{config.MAX_FILE_SIZE_MB}MB)."
         )
         return
 
@@ -208,7 +191,7 @@ async def handle_url(msg: Message):
     await db.log_download(msg.from_user.id, raw, platform, "ok")
 
     try:
-        await status_msg.edit_text(f"📤 Отправляю: {title[:50]}...")
+        await status_msg.edit_text(f"📤 Отправляю...")
         file = FSInputFile(filepath, filename=filename)
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
@@ -221,18 +204,15 @@ async def handle_url(msg: Message):
 
         await status_msg.delete()
 
-        # Покажи остаток лимита если не премиум
-        if not await db.is_premium(msg.from_user.id):
-            used = await db.get_downloads_today(msg.from_user.id)
-            left = config.FREE_DOWNLOADS_PER_DAY - used
-            if left <= 1:
-                b = InlineKeyboardBuilder()
-                b.button(text="⚡️ Купить Premium", callback_data="show_premium")
-                await msg.answer(
-                    f"⚠️ Осталось <b>{left}</b> бесплатных скачиваний сегодня.",
-                    reply_markup=b.as_markup(),
-                    parse_mode=ParseMode.HTML,
-                )
+        # Показываем рекламу каждые N скачиваний
+        total = (await db.get_stats())["total_downloads"]
+        if total % AD_EVERY_N == 0 and ADS:
+            ad = random.choice(ADS)
+            await msg.answer(
+                ad["text"],
+                reply_markup=kb_ad(ad["url"], ad["button"]),
+                parse_mode=ParseMode.HTML,
+            )
 
     except Exception as e:
         log.error(f"Send error: {e}")
@@ -252,12 +232,9 @@ async def cmd_stats(msg: Message):
     text = (
         "📊 <b>Статистика VidBot</b>\n\n"
         f"👥 Всего пользователей: <b>{s['total_users']}</b>\n"
-        f"📅 Новых сегодня: <b>{s['today_users']}</b>\n"
-        f"⭐️ Premium: <b>{s['premium_users']}</b>\n\n"
+        f"📅 Новых сегодня: <b>{s['today_users']}</b>\n\n"
         f"📥 Всего скачиваний: <b>{s['total_downloads']}</b>\n"
-        f"📥 Сегодня: <b>{s['today_downloads']}</b>\n\n"
-        f"💰 Stars заработано: <b>{s['total_stars']} ⭐️</b>\n"
-        f"💵 Примерно: <b>${s['total_stars'] * 0.013:.2f}</b>"
+        f"📥 Сегодня: <b>{s['today_downloads']}</b>"
     )
     await msg.answer(text, parse_mode=ParseMode.HTML)
 
@@ -280,25 +257,6 @@ async def cmd_broadcast(msg: Message):
             failed += 1
         await asyncio.sleep(0.05)
     await status.edit_text(f"✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
-
-
-@dp.message(Command("give_premium"), F.from_user.id == config.ADMIN_ID)
-async def cmd_give_premium(msg: Message):
-    parts = msg.text.split()
-    if len(parts) < 3:
-        await msg.answer("Использование: /give_premium USER_ID DAYS")
-        return
-    try:
-        uid = int(parts[1])
-        days = int(parts[2])
-        await db.activate_premium(uid, days)
-        await msg.answer(f"✅ Premium на {days} дней выдан {uid}")
-        try:
-            await bot.send_message(uid, f"🎁 Тебе выдан Premium на {days} дней!")
-        except Exception:
-            pass
-    except ValueError:
-        await msg.answer("Неверные аргументы.")
 
 
 async def main():
