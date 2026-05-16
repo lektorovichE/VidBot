@@ -18,7 +18,7 @@ import config
 import database as db
 from downloader import (
     fetch_download_url,
-    detect_platform, is_supported_url, CobaltError,
+    detect_platform, CobaltError,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# Рекламные блоки — меняй ссылки и текст под своих рекламодателей
 ADS = [
     {
         "text": "🎰 <b>1WIN</b> — лучший букмекер!\nБонус 500% на первый депозит 🔥",
@@ -41,7 +40,7 @@ ADS = [
     },
 ]
 
-AD_EVERY_N = 5  # показывать рекламу каждые N скачиваний
+AD_EVERY_N = 5
 
 
 def kb_main() -> InlineKeyboardMarkup:
@@ -54,10 +53,7 @@ def kb_main() -> InlineKeyboardMarkup:
 def kb_premium() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for key, plan in config.PLANS.items():
-        b.button(
-            text=f"{plan['label']} — ⭐️ {plan['stars']}",
-            callback_data=f"buy_{key}",
-        )
+        b.button(text=f"{plan['label']} — ⭐️ {plan['stars']}", callback_data=f"buy_{key}")
     b.button(text="◀️ Назад", callback_data="back_main")
     b.adjust(1)
     return b.as_markup()
@@ -66,8 +62,24 @@ def kb_premium() -> InlineKeyboardMarkup:
 def kb_ad(url: str, button_text: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=button_text, url=url)
-    b.adjust(1)
     return b.as_markup()
+
+
+def kb_youtube(options: list, audio_url: str | None) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for opt in options:
+        b.button(text=f"📥 {opt['quality']} ({opt['ext']})", url=opt["url"])
+    if audio_url:
+        b.button(text="🎵 Только аудио", url=audio_url)
+    b.adjust(2)
+    return b.as_markup()
+
+
+async def show_ad(msg: Message):
+    total = (await db.get_stats())["total_downloads"]
+    if total % AD_EVERY_N == 0 and ADS:
+        ad = random.choice(ADS)
+        await msg.answer(ad["text"], reply_markup=kb_ad(ad["url"], ad["button"]), parse_mode=ParseMode.HTML)
 
 
 @dp.message(CommandStart())
@@ -92,7 +104,7 @@ async def cb_help(cq: CallbackQuery):
         "3. Получи файл без водяного знака!\n\n"
         "🎵 <b>Только аудио</b> — добавь перед ссылкой: <code>audio </code>\n"
         "Пример: <code>audio https://youtu.be/xxx</code>\n\n"
-        "📋 Поддерживаю: YouTube, TikTok, Instagram, VK, Twitter/X, Reddit, Twitch и 1000+ других."
+        "📋 YouTube, TikTok, Instagram, VK, Twitter/X и 1000+ других."
     )
     await cq.message.edit_text(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
     await cq.answer()
@@ -100,10 +112,7 @@ async def cb_help(cq: CallbackQuery):
 
 @dp.callback_query(F.data == "back_main")
 async def cb_back(cq: CallbackQuery):
-    await cq.message.edit_text(
-        "Отправь мне ссылку на видео 👇",
-        reply_markup=kb_main(),
-    )
+    await cq.message.edit_text("Отправь мне ссылку на видео 👇", reply_markup=kb_main())
     await cq.answer()
 
 
@@ -117,7 +126,7 @@ async def cb_buy(cq: CallbackQuery):
     await bot.send_invoice(
         chat_id=cq.from_user.id,
         title=f"VidBot Premium — {plan['label']}",
-        description="Безлимитное скачивание видео без водяных знаков.",
+        description="Безлимитное скачивание видео.",
         payload=plan["payload"],
         currency="XTR",
         prices=[LabeledPrice(label=plan["label"], amount=plan["stars"])],
@@ -140,10 +149,7 @@ async def on_payment(msg: Message):
     await db.activate_premium(msg.from_user.id, plan["days"])
     await db.log_payment(msg.from_user.id, stars, payload)
     days_label = "навсегда" if plan["days"] > 1000 else f"на {plan['days']} дней"
-    await msg.answer(
-        f"🎉 <b>Premium активирован {days_label}!</b>\n\nТеперь скачивай без ограничений 🚀",
-        parse_mode=ParseMode.HTML,
-    )
+    await msg.answer(f"🎉 <b>Premium активирован {days_label}!</b>", parse_mode=ParseMode.HTML)
 
 
 @dp.message(F.text)
@@ -158,8 +164,7 @@ async def handle_url(msg: Message):
 
     if not raw.startswith("http"):
         await msg.answer(
-            "📎 Отправь мне ссылку на видео.\n"
-            "Например: <code>https://youtu.be/dQw4w9WgXcQ</code>",
+            "📎 Отправь мне ссылку на видео.\nНапример: <code>https://youtu.be/dQw4w9WgXcQ</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -177,10 +182,30 @@ async def handle_url(msg: Message):
         await db.log_download(msg.from_user.id, raw, platform, "error")
         return
 
-    if result["type"] == "too_large":
-        await status_msg.edit_text(
-            f"⚠️ Видео слишком большое для отправки в Telegram (>{config.MAX_FILE_SIZE_MB}MB)."
+    # YouTube — показываем кнопки качества
+    if result["type"] == "youtube_links":
+        await status_msg.delete()
+        await db.increment_downloads(msg.from_user.id)
+        await db.log_download(msg.from_user.id, raw, platform, "ok")
+
+        title = result.get("title", "Видео")[:200]
+        options = result.get("options", [])
+        audio_url = result.get("audio_url")
+
+        if not options and not audio_url:
+            await msg.answer("❌ Не удалось получить ссылки для скачивания.")
+            return
+
+        await msg.answer(
+            f"🎬 <b>{title}</b>\n\nВыбери качество:",
+            reply_markup=kb_youtube(options, audio_url),
+            parse_mode=ParseMode.HTML,
         )
+        await show_ad(msg)
+        return
+
+    if result["type"] == "too_large":
+        await status_msg.edit_text(f"⚠️ Файл слишком большой для Telegram (>{config.MAX_FILE_SIZE_MB}MB).")
         return
 
     filepath = result["path"]
@@ -191,7 +216,7 @@ async def handle_url(msg: Message):
     await db.log_download(msg.from_user.id, raw, platform, "ok")
 
     try:
-        await status_msg.edit_text(f"📤 Отправляю...")
+        await status_msg.edit_text("📤 Отправляю...")
         file = FSInputFile(filepath, filename=filename)
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
@@ -203,16 +228,7 @@ async def handle_url(msg: Message):
             await msg.answer_document(file, caption=f"📥 {title[:200]}")
 
         await status_msg.delete()
-
-        # Показываем рекламу каждые N скачиваний
-        total = (await db.get_stats())["total_downloads"]
-        if total % AD_EVERY_N == 0 and ADS:
-            ad = random.choice(ADS)
-            await msg.answer(
-                ad["text"],
-                reply_markup=kb_ad(ad["url"], ad["button"]),
-                parse_mode=ParseMode.HTML,
-            )
+        await show_ad(msg)
 
     except Exception as e:
         log.error(f"Send error: {e}")
@@ -229,14 +245,14 @@ async def handle_url(msg: Message):
 @dp.message(Command("stats"), F.from_user.id == config.ADMIN_ID)
 async def cmd_stats(msg: Message):
     s = await db.get_stats()
-    text = (
-        "📊 <b>Статистика VidBot</b>\n\n"
-        f"👥 Всего пользователей: <b>{s['total_users']}</b>\n"
-        f"📅 Новых сегодня: <b>{s['today_users']}</b>\n\n"
-        f"📥 Всего скачиваний: <b>{s['total_downloads']}</b>\n"
-        f"📥 Сегодня: <b>{s['today_downloads']}</b>"
+    await msg.answer(
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{s['total_users']}</b>\n"
+        f"📅 Новых сегодня: <b>{s['today_users']}</b>\n"
+        f"📥 Скачиваний всего: <b>{s['total_downloads']}</b>\n"
+        f"📥 Сегодня: <b>{s['today_downloads']}</b>",
+        parse_mode=ParseMode.HTML,
     )
-    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("broadcast"), F.from_user.id == config.ADMIN_ID)
@@ -246,8 +262,7 @@ async def cmd_broadcast(msg: Message):
         await msg.answer("Использование: /broadcast Текст")
         return
     user_ids = await db.get_all_user_ids()
-    sent = 0
-    failed = 0
+    sent = failed = 0
     status = await msg.answer(f"📢 Отправляю {len(user_ids)} пользователям...")
     for uid in user_ids:
         try:
