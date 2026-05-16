@@ -89,7 +89,7 @@ async def cmd_start(msg: Message):
         f"👋 Привет, <b>{msg.from_user.first_name}</b>!\n\n"
         "Скачиваю видео без водяных знаков с:\n"
         "▸ YouTube · TikTok · Instagram · VK\n"
-        "▸ Twitter/X · Reddit · Twitch · и ещё 1000+\n\n"
+        "▸ Twitter/X · Reddit · Twitch\n\n"
         "📎 <b>Просто отправь мне ссылку</b> — и всё!"
     )
     await msg.answer(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
@@ -104,7 +104,7 @@ async def cb_help(cq: CallbackQuery):
         "3. Получи файл без водяного знака!\n\n"
         "🎵 <b>Только аудио</b> — добавь перед ссылкой: <code>audio </code>\n"
         "Пример: <code>audio https://youtu.be/xxx</code>\n\n"
-        "📋 YouTube, TikTok, Instagram, VK, Twitter/X и 1000+ других."
+        "📋 Поддерживаю: YouTube, TikTok, Instagram, VK, Twitter/X, Reddit, Twitch."
     )
     await cq.message.edit_text(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
     await cq.answer()
@@ -182,7 +182,6 @@ async def handle_url(msg: Message):
         await db.log_download(msg.from_user.id, raw, platform, "error")
         return
 
-    # YouTube — показываем кнопки качества
     if result["type"] == "youtube_links":
         await status_msg.delete()
         await db.increment_downloads(msg.from_user.id)
