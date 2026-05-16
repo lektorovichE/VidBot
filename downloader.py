@@ -32,8 +32,6 @@ def is_supported_url(url: str) -> bool:
 
 
 async def fetch_download_url(url: str, audio_only: bool = False, quality: str = "max") -> dict:
-    """Скачивает видео через yt-dlp и возвращает путь к файлу."""
-
     tmp_dir = tempfile.mkdtemp()
     out_template = os.path.join(tmp_dir, "%(title).50s.%(ext)s")
 
@@ -43,24 +41,18 @@ async def fetch_download_url(url: str, audio_only: bool = False, quality: str = 
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
         }
     else:
         if quality == "max":
-            fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            fmt = "best[ext=mp4]/best"
         else:
-            fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]"
+            fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
 
         ydl_opts = {
             "format": fmt,
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
-            "merge_output_format": "mp4",
         }
 
     try:
@@ -68,11 +60,6 @@ async def fetch_download_url(url: str, audio_only: bool = False, quality: str = 
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
 
-            # Если аудио — ищем mp3
-            if audio_only:
-                filename = os.path.splitext(filename)[0] + ".mp3"
-
-            # Найти реальный файл если имя немного другое
             if not os.path.exists(filename):
                 files = os.listdir(tmp_dir)
                 if files:
@@ -109,4 +96,4 @@ async def fetch_download_url(url: str, audio_only: bool = False, quality: str = 
 
 
 async def download_file(url: str, filename: str):
-    pass  # Не используется с yt-dlp
+    pass
