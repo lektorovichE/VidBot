@@ -27,11 +27,75 @@ def detect_platform(url: str) -> str:
     return "Видео"
 
 
+def is_youtube(url: str) -> bool:
+    return bool(re.search(r"(youtube\.com|youtu\.be)", url))
+
+
 def is_supported_url(url: str) -> bool:
     return url.startswith("http")
 
 
+def get_youtube_links(url: str) -> dict:
+    """Получает прямые ссылки на скачивание YouTube видео без загрузки."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": "best[ext=mp4]/best",
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get("title", "Видео")
+
+            formats = info.get("formats", [])
+
+            # Собираем варианты качества
+            options = []
+            seen = set()
+            for f in reversed(formats):
+                height = f.get("height")
+                ext = f.get("ext", "")
+                furl = f.get("url", "")
+                vcodec = f.get("vcodec", "none")
+                acodec = f.get("acodec", "none")
+
+                if not furl:
+                    continue
+                if vcodec == "none":
+                    continue
+                if height and height not in seen and ext in ("mp4", "webm"):
+                    seen.add(height)
+                    options.append({
+                        "quality": f"{height}p",
+                        "url": furl,
+                        "ext": ext,
+                    })
+                    if len(options) >= 5:
+                        break
+
+            # Аудио
+            audio_url = None
+            for f in reversed(formats):
+                if f.get("vcodec") == "none" and f.get("acodec") != "none":
+                    audio_url = f.get("url")
+                    break
+
+            return {
+                "type": "youtube_links",
+                "title": title,
+                "options": options,
+                "audio_url": audio_url,
+            }
+    except Exception as e:
+        raise CobaltError(f"YouTube: {str(e)[:150]}")
+
+
 async def fetch_download_url(url: str, audio_only: bool = False, quality: str = "max") -> dict:
+    # YouTube — отдаём прямые ссылки
+    if is_youtube(url):
+        return get_youtube_links(url)
+
     tmp_dir = tempfile.mkdtemp()
     out_template = os.path.join(tmp_dir, "%(title).50s.%(ext)s")
 
