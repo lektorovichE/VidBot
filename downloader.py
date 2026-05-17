@@ -1,8 +1,15 @@
 import yt_dlp
+import aiohttp
 import os
 import tempfile
 import re
-from config import MAX_FILE_SIZE_BYTES, SUPPORTED_DOMAINS
+from config import MAX_FILE_SIZE_BYTES
+
+COBALT_INSTANCES = [
+    "https://cobalt.tools/",
+    "https://co.wuk.sh/",
+    "https://cobalt.api.timelessnesses.me/",
+]
 
 
 class CobaltError(Exception):
@@ -19,7 +26,6 @@ def detect_platform(url: str) -> str:
         r"reddit\.com": "Reddit",
         r"twitch\.tv": "Twitch",
         r"soundcloud\.com": "SoundCloud",
-        r"pinterest\.com": "Pinterest",
     }
     for pattern, name in mapping.items():
         if re.search(pattern, url):
@@ -35,67 +41,66 @@ def is_supported_url(url: str) -> bool:
     return url.startswith("http")
 
 
-def get_youtube_links(url: str) -> dict:
-    """Получает прямые ссылки на скачивание YouTube видео без загрузки."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "format": "best[ext=mp4]/best",
+async def fetch_youtube_cobalt(url: str, audio_only: bool = False) -> dict:
+    """Пробуем разные cobalt инстансы для YouTube."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get("title", "Видео")
+    body = {
+        "url": url,
+        "downloadMode": "audio" if audio_only else "auto",
+        "videoQuality": "1080",
+    }
 
-            formats = info.get("formats", [])
+    async with aiohttp.ClientSession() as session:
+        for instance in COBALT_INSTANCES:
+            try:
+                async with session.post(
+                    instance,
+                    json=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=False,
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    status = data.get("status", "")
 
-            # Собираем варианты качества
-            options = []
-            seen = set()
-            for f in reversed(formats):
-                height = f.get("height")
-                ext = f.get("ext", "")
-                furl = f.get("url", "")
-                vcodec = f.get("vcodec", "none")
-                acodec = f.get("acodec", "none")
+                    if status in ("redirect", "tunnel"):
+                        return {
+                            "type": "youtube_links",
+                            "title": "YouTube видео",
+                            "options": [{"quality": "Лучшее качество", "url": data["url"], "ext": "mp4"}],
+                            "audio_url": None,
+                        }
+                    if status == "picker":
+                        options = []
+                        for item in data.get("picker", [])[:5]:
+                            options.append({
+                                "quality": item.get("quality", "Скачать"),
+                                "url": item["url"],
+                                "ext": "mp4",
+                            })
+                        return {
+                            "type": "youtube_links",
+                            "title": "YouTube видео",
+                            "options": options,
+                            "audio_url": data.get("audio"),
+                        }
+            except Exception:
+                continue
 
-                if not furl:
-                    continue
-                if vcodec == "none":
-                    continue
-                if height and height not in seen and ext in ("mp4", "webm"):
-                    seen.add(height)
-                    options.append({
-                        "quality": f"{height}p",
-                        "url": furl,
-                        "ext": ext,
-                    })
-                    if len(options) >= 5:
-                        break
-
-            # Аудио
-            audio_url = None
-            for f in reversed(formats):
-                if f.get("vcodec") == "none" and f.get("acodec") != "none":
-                    audio_url = f.get("url")
-                    break
-
-            return {
-                "type": "youtube_links",
-                "title": title,
-                "options": options,
-                "audio_url": audio_url,
-            }
-    except Exception as e:
-        raise CobaltError(f"YouTube: {str(e)[:150]}")
+    raise CobaltError("YouTube временно недоступен. Попробуй позже.")
 
 
 async def fetch_download_url(url: str, audio_only: bool = False, quality: str = "max") -> dict:
-    # YouTube — отдаём прямые ссылки
+    # YouTube — через cobalt
     if is_youtube(url):
-        return get_youtube_links(url)
+        return await fetch_youtube_cobalt(url, audio_only=audio_only)
 
+    # Остальные платформы — через yt-dlp
     tmp_dir = tempfile.mkdtemp()
     out_template = os.path.join(tmp_dir, "%(title).50s.%(ext)s")
 
@@ -105,18 +110,16 @@ async def fetch_download_url(url: str, audio_only: bool = False, quality: str = 
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
+            "no_check_certificates": True,
         }
     else:
-        if quality == "max":
-            fmt = "best[ext=mp4]/best"
-        else:
-            fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
-
+        fmt = "best[ext=mp4]/best" if quality == "max" else f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
         ydl_opts = {
             "format": fmt,
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
+            "no_check_certificates": True,
         }
 
     try:
@@ -152,8 +155,6 @@ async def fetch_download_url(url: str, audio_only: bool = False, quality: str = 
             raise CobaltError("Видео недоступно (удалено или заблокировано).")
         if "sign in" in err or "login" in err:
             raise CobaltError("Видео требует авторизации.")
-        if "copyright" in err:
-            raise CobaltError("Видео заблокировано по авторским правам.")
         raise CobaltError(f"Не удалось скачать: {str(e)[:150]}")
     except Exception as e:
         raise CobaltError(f"Ошибка: {str(e)[:150]}")
